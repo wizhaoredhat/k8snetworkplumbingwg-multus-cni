@@ -86,28 +86,21 @@ func (cp *checkpoint) getPodEntries() error {
 	return nil
 }
 
-// GetPodResourceMap returns an instance of a map of ResourceInfo
-func (cp *checkpoint) GetPodResourceMap(pod *v1.Pod) (map[string]*types.ResourceInfo, error) {
+// GetPodDeviceAllocation returns per-container device allocation for the given pod.
+func (cp *checkpoint) GetPodDeviceAllocation(pod *v1.Pod) (*types.PodDeviceAllocation, error) {
 	podID := string(pod.UID)
-	resourceMap := make(map[string]*types.ResourceInfo)
+	alloc := types.NewPodDeviceAllocation()
 
 	if podID == "" {
-		return nil, logging.Errorf("GetPodResourceMap: invalid Pod cannot be empty")
+		return nil, logging.Errorf("GetPodDeviceAllocation: invalid Pod cannot be empty")
 	}
-	for _, pod := range cp.podEntires {
-		if pod.PodUID == podID {
-			entry, ok := resourceMap[pod.ResourceName]
-			if !ok {
-				// new entry
-				entry = &types.ResourceInfo{}
-				resourceMap[pod.ResourceName] = entry
-			}
-			for _, v := range pod.DeviceIDs {
-				// already exists; append to it
-				entry.DeviceIDs = append(entry.DeviceIDs, v...)
+	for _, entry := range cp.podEntires {
+		if entry.PodUID == podID {
+			for _, v := range entry.DeviceIDs {
+				alloc.AddContainerDevices(entry.ContainerName, entry.ResourceName, v)
 			}
 		}
 	}
-	types.SortDeviceIDs(resourceMap)
-	return resourceMap, nil
+	alloc.SortDeviceIDsPerContainer()
+	return alloc, nil
 }

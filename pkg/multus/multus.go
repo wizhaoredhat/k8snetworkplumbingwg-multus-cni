@@ -763,12 +763,11 @@ func CmdAdd(args *skel.CmdArgs, exec invoke.Exec, kubeClient *k8s.ClientInfo) (c
 		return nil, err
 	}
 
-	// resourceMap holds Pod device allocation information; only initizized if CRD contains 'resourceName' annotation.
-	// This will only be initialized once and all delegate objects can reference this to look up device info.
-	var resourceMap map[string]*types.ResourceInfo
+	// deviceAlloc holds per-container Pod device allocation; initialized when a NAD has a resourceName annotation.
+	var deviceAlloc *types.PodDeviceAllocation
 
 	if n.ClusterNetwork != "" {
-		resourceMap, err = k8s.GetDefaultNetworks(pod, n, kubeClient, resourceMap)
+		deviceAlloc, err = k8s.GetDefaultNetworks(pod, n, kubeClient, deviceAlloc)
 		if err != nil {
 			return nil, cmdErr(k8sArgs, "failed to get clusterNetwork/defaultNetworks: %v", err)
 		}
@@ -776,7 +775,7 @@ func CmdAdd(args *skel.CmdArgs, exec invoke.Exec, kubeClient *k8s.ClientInfo) (c
 		n.Delegates[0].MasterPlugin = true
 	}
 
-	_, kc, err := k8s.TryLoadPodDelegates(pod, n, kubeClient, resourceMap)
+	_, kc, err := k8s.TryLoadPodDelegates(pod, n, kubeClient, deviceAlloc)
 	if err != nil {
 		return nil, cmdErr(k8sArgs, "error loading k8s delegates k8s args: %v", err)
 	}

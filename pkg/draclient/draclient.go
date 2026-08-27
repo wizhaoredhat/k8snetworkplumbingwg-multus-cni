@@ -56,7 +56,7 @@ type deviceInfoCacheKey struct {
 }
 
 type ClientInterface interface {
-	GetPodResourceMap(ctx context.Context, pod *v1.Pod, resourceMap map[string]*types.ResourceInfo) error
+	GetPodDeviceAllocation(ctx context.Context, pod *v1.Pod, alloc *types.PodDeviceAllocation) error
 }
 
 type draClient struct {
@@ -100,7 +100,7 @@ func NewClient(client resourcev1.ResourceV1Interface) ClientInterface {
 	}
 }
 
-// GetPodResourceMap populates resourceMap with device IDs for all DRA-allocated devices
+// GetPodDeviceAllocation populates alloc with device IDs for all DRA-allocated devices
 // that Multus needs to configure networking for the given pod.
 //
 // It walks pod.Status.ResourceClaimStatuses and, for each claim, fetches the
@@ -119,109 +119,124 @@ func NewClient(client resourcev1.ResourceV1Interface) ClientInterface {
 // resource mapping exactly or an error is returned.
 //
 // ctx is respected for cancellation; a 20-second safety timeout is applied on top.
-func (d *draClient) GetPodResourceMap(ctx context.Context, pod *v1.Pod, resourceMap map[string]*types.ResourceInfo) error {
-	logging.Verbosef("GetPodResourceMap: processing DRA resources for pod %s/%s", pod.Namespace, pod.Name)
+func (d *draClient) GetPodDeviceAllocation(ctx context.Context, pod *v1.Pod, alloc *types.PodDeviceAllocation) error {
+	logging.Verbosef("GetPodDeviceAllocation: processing DRA resources for pod %s/%s", pod.Namespace, pod.Name)
 
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	nodeName := pod.Spec.NodeName
+	claimContainers := containersByResourceClaimRef(pod)
 
 	for _, claimResource := range pod.Status.ResourceClaimStatuses {
 		if claimResource.ResourceClaimName == nil {
-			logging.Errorf("GetPodResourceMap: resource claim status has nil ResourceClaimName")
+			logging.Errorf("GetPodDeviceAllocation: resource claim status has nil ResourceClaimName")
 			continue
 		}
 		claimName := *claimResource.ResourceClaimName
 		// claimResource.Name is the pod-local reference name (pod.spec.resourceClaims[].name);
 		// claimName is the actual ResourceClaim object name in the API — the two differ when
 		// the scheduler generates a per-pod ResourceClaim from a ResourceClaimTemplate.
-		logging.Debugf("GetPodResourceMap: processing ResourceClaim %q (pod-local ref: %q)", claimName, claimResource.Name)
+		logging.Debugf("GetPodDeviceAllocation: processing ResourceClaim %q (pod-local ref: %q)", claimName, claimResource.Name)
 
 		resourceClaim, err := d.getOrFetchResourceClaim(ctx, pod.Namespace, claimName)
 		if err != nil {
-			logging.Errorf("GetPodResourceMap: failed to get resource claim %s: %v", claimName, err)
+			logging.Errorf("GetPodDeviceAllocation: failed to get resource claim %s: %v", claimName, err)
 			return err
 		}
 
 		if resourceClaim.Status.Allocation == nil || resourceClaim.Status.Allocation.Devices.Results == nil {
-			logging.Errorf("GetPodResourceMap: claim %s has no device allocation", claimName)
+			logging.Errorf("GetPodDeviceAllocation: claim %s has no device allocation", claimName)
 			return fmt.Errorf("claim %s has no device allocation", claimName)
+		}
+
+		containerName := claimContainers[claimResource.Name]
+		if containerName == "" && len(pod.Spec.Containers) == 1 {
+			containerName = pod.Spec.Containers[0].Name
+		}
+		if containerName == "" {
+			logging.Debugf("GetPodDeviceAllocation: no container mapped for claim ref %q; skipping DRA devices for this claim", claimResource.Name)
+			continue
 		}
 
 		results := resourceClaim.Status.Allocation.Devices.Results
 		resolvedCount := 0
 		for _, result := range results {
-			logging.Debugf("GetPodResourceMap: processing device allocation - driver: %s, pool: %s, device: %s, request: %s",
+			logging.Debugf("GetPodDeviceAllocation: processing device allocation - driver: %s, pool: %s, device: %s, request: %s",
 				result.Driver, result.Pool, result.Device, result.Request)
 
 			info, err := d.getDeviceInfo(ctx, nodeName, result)
 			if err != nil {
 				if errors.Is(err, errDeviceNotInAnySlice) {
 					logging.Warningf(
-						"GetPodResourceMap: skipping allocation result for claim %s (driver=%s pool=%s device=%s): %v",
+						"GetPodDeviceAllocation: skipping allocation result for claim %s (driver=%s pool=%s device=%s): %v",
 						claimName, result.Driver, result.Pool, result.Device, err)
 					continue
 				}
-				logging.Errorf("GetPodResourceMap: failed to get device info for claim %s: %v", claimName, err)
+				logging.Errorf("GetPodDeviceAllocation: failed to get device info for claim %s: %v", claimName, err)
 				return err
 			}
 
 			if info.ResourceName == "" {
 				logging.Warningf(
-					"GetPodResourceMap: skipping allocation result for claim %s (driver=%s pool=%s device=%s): no %q (only devices published for CNI are mapped)",
+					"GetPodDeviceAllocation: skipping allocation result for claim %s (driver=%s pool=%s device=%s): no %q (only devices published for CNI are mapped)",
 					claimName, result.Driver, result.Pool, result.Device, multusResourceNameAttr)
 				continue
 			}
 
-			resourceMapKey := info.ResourceName
-			if rInfo, ok := resourceMap[resourceMapKey]; ok {
-				rInfo.DeviceIDs = append(rInfo.DeviceIDs, info.DeviceID)
-				logging.Debugf("GetPodResourceMap: appended device ID %s to existing resource map entry %s", info.DeviceID, resourceMapKey)
-			} else {
-				resourceMap[resourceMapKey] = &types.ResourceInfo{DeviceIDs: []string{info.DeviceID}}
-				logging.Debugf("GetPodResourceMap: created new resource map entry %s with device ID %s", resourceMapKey, info.DeviceID)
-			}
+			alloc.AddContainerDevices(containerName, info.ResourceName, []string{info.DeviceID})
+			logging.Debugf("GetPodDeviceAllocation: added device ID %s for container %s resource %s", info.DeviceID, containerName, info.ResourceName)
 			resolvedCount++
 		}
 		if resolvedCount == 0 && len(results) > 0 {
 			logging.Warningf(
-				"GetPodResourceMap: claim %s had no allocation results mapped for Multus (skipping this claim; existing kubelet/device-plugin map entries are kept). "+
+				"GetPodDeviceAllocation: claim %s had no allocation results mapped for Multus (skipping this claim; existing kubelet/device-plugin entries are kept). "+
 					"Fix DRA ResourceSlices or Multus attributes if this claim should contribute to CNI.",
 				claimName)
 			continue
 		}
-		logging.Debugf("GetPodResourceMap: successfully processed resource claim %s", claimName)
+		logging.Debugf("GetPodDeviceAllocation: successfully processed resource claim %s", claimName)
 	}
 
 	if pod.Status.ExtendedResourceClaimStatus != nil {
-		if err := d.processExtendedResourceClaimStatus(ctx, nodeName, pod, resourceMap); err != nil {
+		if err := d.processExtendedResourceClaimStatus(ctx, nodeName, pod, alloc); err != nil {
 			return err
 		}
 	}
 
-	types.SortDeviceIDs(resourceMap)
-	logging.Verbosef("GetPodResourceMap: successfully processed all DRA resources for pod %s/%s, total resources: %d",
-		pod.Namespace, pod.Name, len(resourceMap))
+	alloc.SortDeviceIDsPerContainer()
+	logging.Verbosef("GetPodDeviceAllocation: successfully processed all DRA resources for pod %s/%s",
+		pod.Namespace, pod.Name)
 	return nil
 }
 
-// processExtendedResourceClaimStatus fills the resource map for pods that use
+// containersByResourceClaimRef maps pod-local ResourceClaim ref names to container names.
+func containersByResourceClaimRef(pod *v1.Pod) map[string]string {
+	out := make(map[string]string)
+	for _, container := range pod.Spec.Containers {
+		for _, claim := range container.Resources.Claims {
+			out[claim.Name] = container.Name
+		}
+	}
+	return out
+}
+
+// processExtendedResourceClaimStatus fills the allocation for pods that use
 // the extended resource feature gate (pod.Status.ExtendedResourceClaimStatus).
-// Keys come from requestMappings[].resourceName (same as NAD annotation).
-func (d *draClient) processExtendedResourceClaimStatus(ctx context.Context, nodeName string, pod *v1.Pod, resourceMap map[string]*types.ResourceInfo) error {
+// Devices are stored per mapping.ContainerName and mapping.ResourceName.
+func (d *draClient) processExtendedResourceClaimStatus(ctx context.Context, nodeName string, pod *v1.Pod, alloc *types.PodDeviceAllocation) error {
 	extStatus := pod.Status.ExtendedResourceClaimStatus
 	claimName := extStatus.ResourceClaimName
-	logging.Debugf("GetPodResourceMap: processing extended resource claim: %s/%s", pod.Namespace, claimName)
+	logging.Debugf("GetPodDeviceAllocation: processing extended resource claim: %s/%s", pod.Namespace, claimName)
 
 	resourceClaim, err := d.getOrFetchResourceClaim(ctx, pod.Namespace, claimName)
 	if err != nil {
-		logging.Errorf("GetPodResourceMap: failed to get extended resource claim %s/%s: %v", pod.Namespace, claimName, err)
+		logging.Errorf("GetPodDeviceAllocation: failed to get extended resource claim %s/%s: %v", pod.Namespace, claimName, err)
 		return err
 	}
 
 	if resourceClaim.Status.Allocation == nil || resourceClaim.Status.Allocation.Devices.Results == nil {
-		logging.Errorf("GetPodResourceMap: claim %s has no device allocation", claimName)
+		logging.Errorf("GetPodDeviceAllocation: claim %s has no device allocation", claimName)
 		return fmt.Errorf("claim %s has no device allocation", claimName)
 	}
 
@@ -233,42 +248,36 @@ func (d *draClient) processExtendedResourceClaimStatus(ctx context.Context, node
 	for _, mapping := range extStatus.RequestMappings {
 		results, ok := resultsByRequest[mapping.RequestName]
 		if !ok || len(results) == 0 {
-			logging.Errorf("GetPodResourceMap: extended resource request %s not found in claim %s", mapping.RequestName, claimName)
+			logging.Errorf("GetPodDeviceAllocation: extended resource request %s not found in claim %s", mapping.RequestName, claimName)
 			return fmt.Errorf("request %s not found in claim %s", mapping.RequestName, claimName)
 		}
 
-		resourceMapKey := mapping.ResourceName
 		for _, result := range results {
 			info, err := d.getDeviceInfo(ctx, nodeName, result)
 			if err != nil {
-				logging.Errorf("GetPodResourceMap: failed to get device info for extended resource claim %s request %s: %v", claimName, mapping.RequestName, err)
+				logging.Errorf("GetPodDeviceAllocation: failed to get device info for extended resource claim %s request %s: %v", claimName, mapping.RequestName, err)
 				return err
 			}
 
 			if info.ResourceName == "" {
 				resErr := fmt.Errorf("device %s missing required attribute %s (must match NAD k8s.v1.cni.cncf.io/resourceName and extended mapping %q)",
-					result.Device, multusResourceNameAttr, resourceMapKey)
-				logging.Errorf("GetPodResourceMap: %v", resErr)
+					result.Device, multusResourceNameAttr, mapping.ResourceName)
+				logging.Errorf("GetPodDeviceAllocation: %v", resErr)
 				return resErr
 			}
 			if info.ResourceName != mapping.ResourceName {
 				resErr := fmt.Errorf("device %s: %s is %q but extended resource mapping for request %q is %q",
 					result.Device, multusResourceNameAttr, info.ResourceName, mapping.RequestName, mapping.ResourceName)
-				logging.Errorf("GetPodResourceMap: %v", resErr)
+				logging.Errorf("GetPodDeviceAllocation: %v", resErr)
 				return resErr
 			}
 
-			if rInfo, ok := resourceMap[resourceMapKey]; ok {
-				rInfo.DeviceIDs = append(rInfo.DeviceIDs, info.DeviceID)
-				logging.Debugf("GetPodResourceMap: appended device ID %s to extended resource map entry %s", info.DeviceID, resourceMapKey)
-			} else {
-				resourceMap[resourceMapKey] = &types.ResourceInfo{DeviceIDs: []string{info.DeviceID}}
-				logging.Debugf("GetPodResourceMap: created new extended resource map entry %s with device ID %s", resourceMapKey, info.DeviceID)
-			}
+			alloc.AddContainerDevices(mapping.ContainerName, mapping.ResourceName, []string{info.DeviceID})
+			logging.Debugf("GetPodDeviceAllocation: added device ID %s for container %s resource %s", info.DeviceID, mapping.ContainerName, mapping.ResourceName)
 		}
 	}
 
-	logging.Debugf("GetPodResourceMap: successfully processed extended resource claim %s", claimName)
+	logging.Debugf("GetPodDeviceAllocation: successfully processed extended resource claim %s", claimName)
 	return nil
 }
 

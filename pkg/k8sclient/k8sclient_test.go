@@ -36,6 +36,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	resourcev1api "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -59,23 +60,25 @@ func NewFakeClientInfo() *ClientInfo {
 // fakeEmptyResourceClient implements types.ResourceClient with no device allocations (stubs kubelet in tests).
 type fakeEmptyResourceClient struct{}
 
-func (*fakeEmptyResourceClient) GetPodResourceMap(*v1.Pod) (map[string]*types.ResourceInfo, error) {
-	return make(map[string]*types.ResourceInfo), nil
+func (*fakeEmptyResourceClient) GetPodDeviceAllocation(*v1.Pod) (*types.PodDeviceAllocation, error) {
+	return types.NewPodDeviceAllocation(), nil
 }
 
-// fakeResourceClient implements types.ResourceClient with a pre-seeded device-plugin resource map,
+// fakeResourceClient implements types.ResourceClient with a pre-seeded device-plugin allocation,
 // simulating what the kubelet returns for device-plugin (non-DRA) allocations.
 type fakeResourceClient struct {
-	resourceMap map[string]*types.ResourceInfo
+	byContainer map[string]map[string]*types.ResourceInfo
 }
 
-func (f *fakeResourceClient) GetPodResourceMap(*v1.Pod) (map[string]*types.ResourceInfo, error) {
-	result := make(map[string]*types.ResourceInfo)
-	for k, v := range f.resourceMap {
-		cp := &types.ResourceInfo{DeviceIDs: append([]string(nil), v.DeviceIDs...)}
-		result[k] = cp
+func (f *fakeResourceClient) GetPodDeviceAllocation(*v1.Pod) (*types.PodDeviceAllocation, error) {
+	alloc := types.NewPodDeviceAllocation()
+	for container, byResource := range f.byContainer {
+		for resource, info := range byResource {
+			alloc.AddContainerDevices(container, resource, append([]string(nil), info.DeviceIDs...))
+		}
 	}
-	return result, nil
+	alloc.SortDeviceIDsPerContainer()
+	return alloc, nil
 }
 
 var _ = Describe("k8sclient operations", func() {
@@ -184,7 +187,7 @@ var _ = Describe("k8sclient operations", func() {
 		netConf.ConfDir = tmpDir
 		delegates, err := GetNetworkDelegates(clientInfo, pod, networks, netConf, nil)
 		Expect(len(delegates)).To(Equal(0))
-		Expect(err).To(MatchError("GetNetworkDelegates: failed getting the delegate: getKubernetesDelegate: cannot find a network-attachment-definition (net1) in namespace (test): network-attachment-definitions.k8s.cni.cncf.io \"net1\" not found"))
+		Expect(err).To(MatchError("GetNetworkDelegates: failed to get NAD resource names: network-attachment-definitions.k8s.cni.cncf.io \"net1\" not found"))
 	})
 
 	It("retrieves delegates from kubernetes using JSON format annotation", func() {
@@ -1621,6 +1624,10 @@ users:
 
 				fakePod := testutils.NewFakePod(fakePodName, "sriov-net", "")
 				fakePod.Namespace = fakeNamespace
+				fakePod.Spec.Containers[0].Resources.Limits = v1.ResourceList{
+					sriovResName: resource.MustParse("1"),
+				}
+				fakePod.Spec.Containers[0].Resources.Claims = []v1.ResourceClaim{{Name: claimName}}
 				fakePod.Status.ResourceClaimStatuses = []v1.PodResourceClaimStatus{
 					{Name: claimName, ResourceClaimName: &claimNamePtr},
 				}
@@ -1666,13 +1673,12 @@ users:
 
 				net := &types.NetworkSelectionElement{Name: "sriov-net", Namespace: fakeNamespace}
 				// Pass nil so getKubernetesDelegate enters the DRA lookup branch.
-				delegate, resourceMap, err := getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil)
+				delegate, alloc, err := getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil, nil, -1, nil)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(delegate).NotTo(BeNil())
 
-				// The DRA device ID must be in the resource map under the NAD resourceName key.
-				Expect(resourceMap).To(HaveKey(sriovResName))
-				Expect(resourceMap[sriovResName].DeviceIDs).To(ContainElement(deviceID))
+				Expect(delegate.DeviceID).To(Equal(deviceID))
+				Expect(alloc.ByContainer["ctr1"][sriovResName].DeviceIDs).To(ContainElement(deviceID))
 			})
 		})
 
@@ -1787,7 +1793,7 @@ users:
 				}
 
 				// Get network delegates
-				resourceMap := make(map[string]*types.ResourceInfo)
+				resourceMap := types.NewPodDeviceAllocation()
 				delegates, err := GetNetworkDelegates(clientInfo, fakePod, networks, conf, resourceMap)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(delegates).NotTo(BeEmpty())
@@ -1901,7 +1907,7 @@ users:
 				Expect(err).NotTo(HaveOccurred())
 
 				// Try loading pod delegates
-				resourceMap := make(map[string]*types.ResourceInfo)
+				resourceMap := types.NewPodDeviceAllocation()
 				count, updatedClient, err := TryLoadPodDelegates(fakePod, conf, clientInfo, resourceMap)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(updatedClient).NotTo(BeNil())
@@ -1943,11 +1949,10 @@ users:
 				}
 
 				// Call getKubernetesDelegate - should work without DRA
-				delegate, resourceMap, err := getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil)
+				delegate, alloc, err := getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil, nil, -1, nil)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(delegate).NotTo(BeNil())
-				// ResourceMap should be empty (no DRA resources)
-				Expect(len(resourceMap)).To(Equal(0))
+				Expect(alloc).To(BeNil())
 			})
 		})
 
@@ -2010,9 +2015,9 @@ users:
 					Namespace: fakeNamespace,
 				}
 
-				_, _, err = getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil)
+				_, _, err = getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil, nil, -1, nil)
 				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("failed to get resourceMap from DRA client"))
+				Expect(err.Error()).To(ContainSubstring("failed to get device allocation from DRA client"))
 				Expect(err.Error()).To(ContainSubstring("not found"))
 			})
 		})
@@ -2109,7 +2114,7 @@ users:
 				Expect(err).NotTo(HaveOccurred())
 
 				// Call getNetDelegate
-				resourceMap := make(map[string]*types.ResourceInfo)
+				resourceMap := types.NewPodDeviceAllocation()
 				delegate, updatedResourceMap, err := getNetDelegate(clientInfo, fakePod, "netdelegate-network", tmpDir, fakeNamespace, resourceMap)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(delegate).NotTo(BeNil())
@@ -2128,8 +2133,10 @@ users:
 				origGetResourceClient = getResourceClientFunc
 				getResourceClientFunc = func(string) (types.ResourceClient, error) {
 					return &fakeResourceClient{
-						resourceMap: map[string]*types.ResourceInfo{
-							sriovResourceName: {DeviceIDs: []string{sriovDeviceIDKubelet}},
+						byContainer: map[string]map[string]*types.ResourceInfo{
+							"ctr1": {
+								sriovResourceName: {DeviceIDs: []string{sriovDeviceIDKubelet}},
+							},
 						},
 					}, nil
 				}
@@ -2153,6 +2160,10 @@ users:
 				claimNamePtr := claimName
 				fakePod := testutils.NewFakePod(fakePodName, "sriov-net", "")
 				fakePod.Namespace = fakeNamespace
+				fakePod.Spec.Containers[0].Resources.Limits = v1.ResourceList{
+					sriovResourceName: resource.MustParse("1"),
+				}
+				fakePod.Spec.Containers[0].Resources.Claims = []v1.ResourceClaim{{Name: claimName}}
 				fakePod.Status.ResourceClaimStatuses = []v1.PodResourceClaimStatus{
 					{Name: claimName, ResourceClaimName: &claimNamePtr},
 				}
@@ -2198,13 +2209,12 @@ users:
 				Expect(err).NotTo(HaveOccurred())
 
 				net := &types.NetworkSelectionElement{Name: "sriov-net", Namespace: fakeNamespace}
-				delegate, resourceMap, err := getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil)
+				delegate, alloc, err := getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil, nil, -1, nil)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(delegate).NotTo(BeNil())
 
-				// Both kubelet and DRA device IDs must be present under the same resource name key
-				Expect(resourceMap).To(HaveKey(sriovResourceName))
-				Expect(resourceMap[sriovResourceName].DeviceIDs).To(ConsistOf(sriovDeviceIDKubelet, sriovDeviceIDDRA))
+				Expect(alloc.ByContainer["ctr1"][sriovResourceName].DeviceIDs).To(ConsistOf(sriovDeviceIDKubelet, sriovDeviceIDDRA))
+				Expect(delegate.DeviceID).To(Equal(sriovDeviceIDKubelet))
 			})
 
 			It("should silently skip a GPU DRA claim that has no CNI attributes and still resolve the device-plugin SR-IOV entry", func() {
@@ -2220,6 +2230,10 @@ users:
 				claimNamePtr := claimName
 				fakePod := testutils.NewFakePod(fakePodName, "sriov-net", "")
 				fakePod.Namespace = fakeNamespace
+				fakePod.Spec.Containers[0].Resources.Limits = v1.ResourceList{
+					sriovResourceName: resource.MustParse("1"),
+				}
+				fakePod.Spec.Containers[0].Resources.Claims = []v1.ResourceClaim{{Name: claimName}}
 				fakePod.Status.ResourceClaimStatuses = []v1.PodResourceClaimStatus{
 					{Name: claimName, ResourceClaimName: &claimNamePtr},
 				}
@@ -2262,14 +2276,87 @@ users:
 				Expect(err).NotTo(HaveOccurred())
 
 				net := &types.NetworkSelectionElement{Name: "sriov-net", Namespace: fakeNamespace}
-				delegate, resourceMap, err := getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil)
+				delegate, alloc, err := getKubernetesDelegate(clientInfo, net, tmpDir, fakePod, nil, nil, -1, nil)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(delegate).NotTo(BeNil())
 
-				// GPU claim contributed nothing; only the kubelet device-plugin entry is present
-				Expect(resourceMap).To(HaveKey(sriovResourceName))
-				Expect(resourceMap[sriovResourceName].DeviceIDs).To(Equal([]string{sriovDeviceIDKubelet}))
+				Expect(alloc.ByContainer["ctr1"][sriovResourceName].DeviceIDs).To(Equal([]string{sriovDeviceIDKubelet}))
+				Expect(delegate.DeviceID).To(Equal(sriovDeviceIDKubelet))
 			})
+		})
+	})
+
+	Describe("Per-container device allocation", func() {
+		var tmpDir string
+		var origGetResourceClient func(string) (types.ResourceClient, error)
+
+		const sriovResName = "intel.com/sriov"
+
+		BeforeEach(func() {
+			tmpDir, err = os.MkdirTemp("", "multus_per_container_test")
+			Expect(err).NotTo(HaveOccurred())
+			origGetResourceClient = getResourceClientFunc
+		})
+
+		AfterEach(func() {
+			getResourceClientFunc = origGetResourceClient
+			Expect(os.RemoveAll(tmpDir)).To(Succeed())
+		})
+
+		It("assigns distinct deviceIDs to NADs via container inference when two containers share a resourceName", func() {
+			const fakeNamespace = "default"
+			const deviceDP1 = "0000:d8:00.5"
+			const deviceDP2 = "0000:d8:00.2"
+
+			getResourceClientFunc = func(string) (types.ResourceClient, error) {
+				return &fakeResourceClient{
+					byContainer: map[string]map[string]*types.ResourceInfo{
+						"dpdk1": {sriovResName: {DeviceIDs: []string{deviceDP1}}},
+						"dpdk2": {sriovResName: {DeviceIDs: []string{deviceDP2}}},
+					},
+				}, nil
+			}
+
+			netAttachDef := `{"name":"sriov-net","type":"sriov","cniVersion":"0.3.1"}`
+			fakePod := testutils.NewFakePod("multi-sriov-pod", "net-a,net-b", "")
+			fakePod.Namespace = fakeNamespace
+			fakePod.Spec.Containers = []v1.Container{
+				{
+					Name: "dpdk1",
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{sriovResName: resource.MustParse("1")},
+					},
+				},
+				{
+					Name: "dpdk2",
+					Resources: v1.ResourceRequirements{
+						Limits: v1.ResourceList{sriovResName: resource.MustParse("1")},
+					},
+				},
+			}
+
+			clientInfo := NewFakeClientInfo()
+			_, err = clientInfo.AddPod(fakePod)
+			Expect(err).NotTo(HaveOccurred())
+
+			for _, netName := range []string{"net-a", "net-b"} {
+				nad := testutils.NewFakeNetAttachDef(fakeNamespace, netName, netAttachDef)
+				nad.Annotations = map[string]string{resourceNameAnnot: sriovResName}
+				_, err = clientInfo.AddNetAttachDef(nad)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			networks, err := GetPodNetwork(fakePod)
+			Expect(err).NotTo(HaveOccurred())
+			netConf, err := types.LoadNetConf([]byte(genericConf))
+			Expect(err).NotTo(HaveOccurred())
+			netConf.ConfDir = tmpDir
+
+			delegates, err := GetNetworkDelegates(clientInfo, fakePod, networks, netConf, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(delegates).To(HaveLen(2))
+			Expect(delegates[0].DeviceID).To(Equal(deviceDP1))
+			Expect(delegates[1].DeviceID).To(Equal(deviceDP2))
 		})
 	})
 })

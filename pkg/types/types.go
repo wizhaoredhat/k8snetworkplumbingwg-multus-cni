@@ -17,7 +17,6 @@ package types
 
 import (
 	"net"
-	"sort"
 
 	"github.com/containernetworking/cni/pkg/types"
 	cni100 "github.com/containernetworking/cni/pkg/types/100"
@@ -155,6 +154,8 @@ type NetworkSelectionElement struct {
 	BandwidthRequest *BandwidthEntry `json:"bandwidth,omitempty"`
 	// DeviceID contains an optional requested deviceID the network
 	DeviceID string `json:"deviceID,omitempty"`
+	// ContainerName contains an optional pod container name that owns the device for this network
+	ContainerName string `json:"containerName,omitempty"`
 	// CNIArgs contains additional CNI arguments for the network interface
 	CNIArgs *map[string]interface{} `json:"cni-args"`
 	// GatewayRequest contains default route IP address for the pod
@@ -177,18 +178,8 @@ type ResourceInfo struct {
 	DeviceIDs []string
 }
 
-// SortDeviceIDs sorts DeviceIDs in each ResourceInfo in place so that device
-// order is deterministic across GetPodResourceMap callers (e.g. Multus and OVN-Kubernetes).
-func SortDeviceIDs(resourceMap map[string]*ResourceInfo) {
-	for _, rInfo := range resourceMap {
-		if rInfo.DeviceIDs != nil {
-			sort.Strings(rInfo.DeviceIDs)
-		}
-	}
-}
-
 // ResourceClient provides a kubelet Pod resource handle
 type ResourceClient interface {
-	// GetPodResourceMap returns an instance of a map of Pod ResourceInfo given a (Pod name, namespace) tuple
-	GetPodResourceMap(*v1.Pod) (map[string]*ResourceInfo, error)
+	// GetPodDeviceAllocation returns per-container device allocation for the given pod.
+	GetPodDeviceAllocation(*v1.Pod) (*PodDeviceAllocation, error)
 }

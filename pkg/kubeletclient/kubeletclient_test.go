@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -35,7 +36,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 
-	mtypes "gopkg.in/k8snetworkplumbingwg/multus-cni.v4/pkg/types"
 	podresourcesapi "k8s.io/kubelet/pkg/apis/podresources/v1"
 )
 
@@ -61,13 +61,6 @@ func (m *fakeResourceServer) Get(_ context.Context, _ *podresourcesapi.GetPodRes
 }
 
 func (m *fakeResourceServer) List(_ context.Context, _ *podresourcesapi.ListPodResourcesRequest) (*podresourcesapi.ListPodResourcesResponse, error) {
-	devs := []*podresourcesapi.ContainerDevices{
-		{
-			ResourceName: "resource",
-			DeviceIds:    []string{"dev0", "dev1"},
-		},
-	}
-
 	resp := &podresourcesapi.ListPodResourcesResponse{
 		PodResources: []*podresourcesapi.PodResources{
 			{
@@ -75,8 +68,22 @@ func (m *fakeResourceServer) List(_ context.Context, _ *podresourcesapi.ListPodR
 				Namespace: "pod-namespace",
 				Containers: []*podresourcesapi.ContainerResources{
 					{
-						Name:    "container-name",
-						Devices: devs,
+						Name: "container-name",
+						Devices: []*podresourcesapi.ContainerDevices{
+							{
+								ResourceName: "resource",
+								DeviceIds:    []string{"dev0", "dev1"},
+							},
+						},
+					},
+					{
+						Name: "container-name-2",
+						Devices: []*podresourcesapi.ContainerDevices{
+							{
+								ResourceName: "resource",
+								DeviceIds:    []string{"dev2"},
+							},
+						},
 					},
 				},
 			},
@@ -132,9 +139,9 @@ func setUp() error {
 	if err != nil {
 		return err
 	}
-	testingPodResourcesPath := filepath.Join(tempSocketDir, defaultPodResourcesPath)
+	testingPodResourcesPath := filepath.Join(tempSocketDir, strings.TrimPrefix(defaultPodResourcesPath, "/"))
 
-	if err := os.MkdirAll(testingPodResourcesPath, os.ModeDir); err != nil {
+	if err := os.MkdirAll(testingPodResourcesPath, 0750); err != nil {
 		return err
 	}
 
@@ -184,7 +191,7 @@ var _ = Describe("Kubelet resource endpoint data read operations", func() {
 			Expect(err.Error()).To(ContainSubstring("error reading file"))
 		})
 	})
-	Context("GetPodResourceMap() with valid pod name and namespace", func() {
+	Context("GetPodDeviceAllocation() with valid pod name and namespace", func() {
 		It("should return no error with device plugin resource", func() {
 			podUID := k8sTypes.UID("970a395d-bb3b-11e8-89df-408d5c537d23")
 			fakePod := &v1.Pod{
@@ -204,13 +211,30 @@ var _ = Describe("Kubelet resource endpoint data read operations", func() {
 			client, err := getKubeletClient(testKubeletSocket)
 			Expect(err).NotTo(HaveOccurred())
 
-			outputRMap := map[string]*mtypes.ResourceInfo{
-				"resource": {DeviceIDs: []string{"dev0", "dev1"}},
-			}
-			resourceMap, err := client.GetPodResourceMap(fakePod)
+			alloc, err := client.GetPodDeviceAllocation(fakePod)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(resourceMap).ShouldNot(BeNil())
-			Expect(resourceMap).To(Equal(outputRMap))
+			Expect(alloc).ShouldNot(BeNil())
+			Expect(alloc.ByContainer).To(HaveKey("container-name"))
+			Expect(alloc.ByContainer["container-name"]).To(HaveKey("resource"))
+			Expect(alloc.ByContainer["container-name"]["resource"].DeviceIDs).To(Equal([]string{"dev0", "dev1"}))
+		})
+
+		It("should keep devices separate per container when two containers share a resourceName", func() {
+			podUID := k8sTypes.UID("970a395d-bb3b-11e8-89df-408d5c537d23")
+			fakePod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pod-name",
+					Namespace: "pod-namespace",
+					UID:       podUID,
+				},
+			}
+			client, err := getKubeletClient(testKubeletSocket)
+			Expect(err).NotTo(HaveOccurred())
+
+			alloc, err := client.GetPodDeviceAllocation(fakePod)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(alloc.ByContainer["container-name-2"]["resource"].DeviceIDs).To(Equal([]string{"dev2"}))
+			Expect(alloc.ByContainer["container-name"]["resource"].DeviceIDs).NotTo(ContainElement("dev2"))
 		})
 
 		It("should return an error with garbage socket value", func() {
@@ -221,7 +245,7 @@ var _ = Describe("Kubelet resource endpoint data read operations", func() {
 		})
 	})
 
-	Context("GetPodResourceMap() with empty podname", func() {
+	Context("GetPodDeviceAllocation() with empty podname", func() {
 		It("should return error", func() {
 			podUID := k8sTypes.UID("970a395d-bb3b-11e8-89df-408d5c537d23")
 			fakePod := &v1.Pod{
@@ -233,12 +257,12 @@ var _ = Describe("Kubelet resource endpoint data read operations", func() {
 			}
 			client, err := getKubeletClient(testKubeletSocket)
 			Expect(err).NotTo(HaveOccurred())
-			_, err = client.GetPodResourceMap(fakePod)
+			_, err = client.GetPodDeviceAllocation(fakePod)
 			Expect(err).To(HaveOccurred())
 		})
 	})
 
-	Context("GetPodResourceMap() with empty namespace", func() {
+	Context("GetPodDeviceAllocation() with empty namespace", func() {
 		It("should return error", func() {
 			podUID := k8sTypes.UID("970a395d-bb3b-11e8-89df-408d5c537d23")
 			fakePod := &v1.Pod{
@@ -250,12 +274,12 @@ var _ = Describe("Kubelet resource endpoint data read operations", func() {
 			}
 			client, err := getKubeletClient(testKubeletSocket)
 			Expect(err).NotTo(HaveOccurred())
-			_, err = client.GetPodResourceMap(fakePod)
+			_, err = client.GetPodDeviceAllocation(fakePod)
 			Expect(err).To(HaveOccurred())
 		})
 	})
 
-	Context("GetPodResourceMap() with non-existent podname and namespace", func() {
+	Context("GetPodDeviceAllocation() with non-existent podname and namespace", func() {
 		It("should return no error", func() {
 			podUID := k8sTypes.UID("970a395d-bb3b-11e8-89df-408d5c537d23")
 			fakePod := &v1.Pod{
@@ -269,11 +293,10 @@ var _ = Describe("Kubelet resource endpoint data read operations", func() {
 			client, err := getKubeletClient(testKubeletSocket)
 			Expect(err).NotTo(HaveOccurred())
 
-			emptyRMap := map[string]*mtypes.ResourceInfo{}
-			resourceMap, err := client.GetPodResourceMap(fakePod)
+			alloc, err := client.GetPodDeviceAllocation(fakePod)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(resourceMap).ShouldNot(BeNil())
-			Expect(resourceMap).To(Equal(emptyRMap))
+			Expect(alloc).ShouldNot(BeNil())
+			Expect(alloc.ByContainer).To(BeEmpty())
 		})
 	})
 })

@@ -95,10 +95,10 @@ var _ = BeforeSuite(func() {
 var _ = Describe("Kubelet checkpoint data read operations", func() {
 	Context("Using /tmp/kubelet_internal_checkpoint file", func() {
 		var (
-			cp            types.ResourceClient
-			err           error
-			resourceMap   map[string]*types.ResourceInfo
-			resourceInfo  *types.ResourceInfo
+			cp           types.ResourceClient
+			err          error
+			alloc        *types.PodDeviceAllocation
+			resourceInfo *types.ResourceInfo
 			resourceAnnot = "intel.com/sriov_net_A"
 		)
 
@@ -107,7 +107,7 @@ var _ = Describe("Kubelet checkpoint data read operations", func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		It("should return a ResourceMap instance", func() {
+		It("should return a PodDeviceAllocation instance", func() {
 			podUID := k8sTypes.UID("970a395d-bb3b-11e8-89df-408d5c537d23")
 			fakePod := &v1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -116,14 +116,15 @@ var _ = Describe("Kubelet checkpoint data read operations", func() {
 					UID:       podUID,
 				},
 			}
-			rmap, err := cp.GetPodResourceMap(fakePod)
+			gotAlloc, err := cp.GetPodDeviceAllocation(fakePod)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(rmap).NotTo(BeEmpty())
-			resourceMap = rmap
+			Expect(gotAlloc).NotTo(BeNil())
+			Expect(gotAlloc.ByContainer).NotTo(BeEmpty())
+			alloc = gotAlloc
 		})
 
-		It("resourceMap should have value for \"intel.com/sriov_net_A\"", func() {
-			rInfo, ok := resourceMap[resourceAnnot]
+		It("allocation should have value for container appcntr1 resource \"intel.com/sriov_net_A\"", func() {
+			rInfo, ok := alloc.ByContainer["appcntr1"][resourceAnnot]
 			Expect(ok).To(BeTrue())
 			resourceInfo = rInfo
 		})
@@ -139,6 +140,60 @@ var _ = Describe("Kubelet checkpoint data read operations", func() {
 
 		It("should have \"0000:03:02.3\" in deviceIDs[1] (sorted order)", func() {
 			Expect(resourceInfo.DeviceIDs[1]).To(BeEquivalentTo("0000:03:02.3"))
+		})
+	})
+
+	Context("Two containers with the same resourceName", func() {
+		const multiContainerCheckpoint = "/tmp/kubelet_multi_container_checkpoint"
+
+		BeforeEach(func() {
+			sampleData := `{
+				"Data": {
+					"PodDeviceEntries": [
+					{
+						"PodUID": "970a395d-bb3b-11e8-89df-408d5c537d23",
+						"ContainerName": "dpdk1",
+						"ResourceName": "intel.com/sriov",
+						"DeviceIDs": {"-1": ["0000:d8:00.5"]},
+						"AllocResp": ""
+					},
+					{
+						"PodUID": "970a395d-bb3b-11e8-89df-408d5c537d23",
+						"ContainerName": "dpdk2",
+						"ResourceName": "intel.com/sriov",
+						"DeviceIDs": {"-1": ["0000:d8:00.2"]},
+						"AllocResp": ""
+					}
+					],
+					"RegisteredDevices": {}
+				},
+				"Checksum": 0
+			}`
+			fc := &fakeCheckpoint{fileName: multiContainerCheckpoint}
+			err := fc.WriteToFile([]byte(sampleData))
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			_ = os.Remove(multiContainerCheckpoint)
+		})
+
+		It("should not merge or sort device IDs across containers", func() {
+			cp, err := getCheckpoint(multiContainerCheckpoint)
+			Expect(err).NotTo(HaveOccurred())
+
+			podUID := k8sTypes.UID("970a395d-bb3b-11e8-89df-408d5c537d23")
+			fakePod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "fakePod",
+					Namespace: "podNamespace",
+					UID:       podUID,
+				},
+			}
+			alloc, err := cp.GetPodDeviceAllocation(fakePod)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(alloc.ByContainer["dpdk1"]["intel.com/sriov"].DeviceIDs).To(Equal([]string{"0000:d8:00.5"}))
+			Expect(alloc.ByContainer["dpdk2"]["intel.com/sriov"].DeviceIDs).To(Equal([]string{"0000:d8:00.2"}))
 		})
 	})
 
@@ -196,7 +251,7 @@ var _ = Describe("Kubelet checkpoint data read operations", func() {
 			fakeCheckpoint.WriteToFile([]byte(sampleData))
 		})
 
-		It("should not return a ResourceMap instance", func() {
+		It("should not return a PodDeviceAllocation instance", func() {
 			cp, err = getCheckpoint(fakeTempFile)
 			podUID := k8sTypes.UID("")
 			fakePod := &v1.Pod{
@@ -207,9 +262,9 @@ var _ = Describe("Kubelet checkpoint data read operations", func() {
 				},
 			}
 			fmt.Println("fakePod-podID: ", fakePod.UID)
-			rmap, err := cp.GetPodResourceMap(fakePod)
+			gotAlloc, err := cp.GetPodDeviceAllocation(fakePod)
 			Expect(err).To(HaveOccurred())
-			Expect(rmap).To(BeEmpty())
+			Expect(gotAlloc).To(BeNil())
 		})
 	})
 })

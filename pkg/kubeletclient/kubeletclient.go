@@ -122,35 +122,31 @@ func (rc *kubeletClient) getPodResources(client podresourcesapi.PodResourcesList
 	return nil
 }
 
-// GetPodResourceMap returns an instance of a map of Pod ResourceInfo given a (Pod name, namespace) tuple
-func (rc *kubeletClient) GetPodResourceMap(pod *v1.Pod) (map[string]*types.ResourceInfo, error) {
-	resourceMap := make(map[string]*types.ResourceInfo)
+// GetPodDeviceAllocation returns per-container device allocation for the given pod.
+func (rc *kubeletClient) GetPodDeviceAllocation(pod *v1.Pod) (*types.PodDeviceAllocation, error) {
+	alloc := types.NewPodDeviceAllocation()
 
 	name := pod.Name
 	ns := pod.Namespace
 
 	if name == "" || ns == "" {
-		return nil, logging.Errorf("GetPodResourceMap: Pod name or namespace cannot be empty")
+		return nil, logging.Errorf("GetPodDeviceAllocation: Pod name or namespace cannot be empty")
 	}
 
 	for _, pr := range rc.resources {
 		if pr.Name == name && pr.Namespace == ns {
 			for _, cnt := range pr.Containers {
-				rc.getDevicePluginResources(cnt.Devices, resourceMap)
+				rc.addDevicePluginResources(cnt.Name, cnt.Devices, alloc)
 			}
 		}
 	}
-	types.SortDeviceIDs(resourceMap)
-	return resourceMap, nil
+	alloc.SortDeviceIDsPerContainer()
+	return alloc, nil
 }
 
-func (rc *kubeletClient) getDevicePluginResources(devices []*podresourcesapi.ContainerDevices, resourceMap map[string]*types.ResourceInfo) {
+func (rc *kubeletClient) addDevicePluginResources(containerName string, devices []*podresourcesapi.ContainerDevices, alloc *types.PodDeviceAllocation) {
 	for _, dev := range devices {
-		if rInfo, ok := resourceMap[dev.ResourceName]; ok {
-			rInfo.DeviceIDs = append(rInfo.DeviceIDs, dev.DeviceIds...)
-		} else {
-			resourceMap[dev.ResourceName] = &types.ResourceInfo{DeviceIDs: dev.DeviceIds}
-		}
+		alloc.AddContainerDevices(containerName, dev.ResourceName, dev.DeviceIds)
 	}
 }
 
